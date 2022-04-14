@@ -1,0 +1,187 @@
+---
+title: "NCAA Men's Hockey Bracket Buffalo Sabremetrics"
+author: "Nicky Mader"
+date: "`r format(Sys.Date(), '%m-%d-%Y')`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo  = TRUE)
+packages.list <- 
+  c("openxlsx", "MASS", "tidyverse", "stringr", "ggplot2", "scales", "plotly", 
+    "broom", "lubridate", "stringr", "data.table")
+for (p in packages.list){
+  if (!p %in% installed.packages()[, "Package"]) install.packages(p)
+  library(p, character.only = TRUE)
+}
+
+grepv <- function(p, x, ...) grep(pattern = p, x = x, value = TRUE, ...)
+cn <- function(x) colnames(x)
+mean.na <- function(...) mean(na.rm = TRUE, ...)
+sum.na  <- function(...) sum(na.rm = TRUE, ...)
+min.na  <- function(...) min(na.rm = TRUE, ...)
+max.na  <- function(...) max(na.rm = TRUE, ...)
+nonNA   <- function(x) sum(!is.na(x))
+
+path <- "~/GitHub/buffalo-sabremetrics/"
+
+# To-dos
+# - Improve visualization of goal differential vs rank
+# - Do some kind of noodling with the regression model
+
+```
+
+# Clean Data
+
+Read in the USCHO schedule data.
+
+```{r read and clean data}
+
+### Read data and separate ranks for team names
+d <-
+  read.xlsx(xlsxFile = paste0(path, "NCAA Men's Div I Hockey - Season Game Data.xlsx"), 
+            sheet = "2021-22") %>%
+  select(Date = Date1, Opponent, Opp.Score, Home, Score, OT) %>%
+  mutate(Date = ymd(Date),
+         opp_rank  = ifelse(grepl("\\(\\d+\\)", Opponent), gsub("\\((\\d+)\\).+", "\\1", Opponent), NA) %>% as.numeric(),
+         home_rank = ifelse(grepl("\\(\\d+\\)", Home),     gsub("\\((\\d+)\\).+", "\\1", Home),     NA) %>% as.numeric(),
+         opp  = gsub("\\(.+\\)", "", Opponent) %>% str_trim() %>% gsub(" ", "_", x=.) %>% gsub("[\\. '-]", "", x=.),
+         home = gsub("\\(.+\\)", "", Home)     %>% str_trim() %>% gsub(" ", "_", x=.) %>% gsub("[\\. '-]", "", x=.)) %>%
+  select(-Opponent, -Home)
+teams <- with(d, c(opp, home)) %>% unique() %>% sort()
+teams
+```
+
+```{r develop last rank info}
+ranks <-
+  rbind(select(d, Date, team = opp,  rank = opp_rank),
+        select(d, Date, team = home, rank = home_rank))
+last_rank <-
+  ranks %>%
+  arrange(Date) %>%
+  group_by(team) %>%
+  summarize(last_rank = max(rank[Date == max(Date)]))
+
+last_rank %>% filter(!is.na(last_rank)) %>% arrange(last_rank)
+```
+
+# Perform Modeling
+
+```{r prep data for modeling}
+dt_reg <-
+  data.table(d) %>% 
+  .[j = paste0("d_", teams) := lapply(teams, function(team) 1*(team == home) + (-1)*(team == opp))] %>%
+  mutate(diff = Score - Opp.Score,
+         days_since_start = Date - min(Date),
+         days_scaled = as.integer(days_since_start) / max(as.integer(days_since_start)) + 1) %>%
+  select(-d_US_Under18_Team) %>%  # -d_Acadia, -d_TBD, 
+  filter(!str_detect("TBD|US_Under18", home) & !grepl("TBD|US_Under18", opp))
+
+filter(dt_reg, str_detect(home, "Minnesota_D")) %>% select(Date, Opp.Score, Score, opp, home, d_Minnesota_Duluth) %>% head()
+filter(dt_reg, str_detect(opp,  "Minnesota_D")) %>% select(Date, Opp.Score, Score, opp, home, d_Minnesota_Duluth) %>% head()
+```
+
+## Standard OLS for Goal Differential
+
+```{r ols}
+inds <- str_subset(cn(dt_reg), "^d_")
+# Select Wisconsin as the reference
+inds <- setdiff(inds, "d_Wisconsin")
+
+reg_fm <- as.formula(paste0("diff ~ ", paste(inds, collapse = " + ")))
+reg <- lm(reg_fm, 
+          weights = days_scaled^2,
+          data = dt_reg)
+reg_coeff <- tidy(reg) %>% mutate(team = gsub("^d_", "", term))
+
+```
+
+## Ordered Logistic
+
+```{r ordered logstic}
+# See this UCLA stats post with notes on using polr:
+# https://stats.idre.ucla.edu/r/dae/ordinal-logistic-regression/
+table(dt_reg$diff)
+
+dt_ol <-
+  dt_reg %>% 
+  filter(diff %in% -6:6) %>%  # keep data within bounds that have at least some reasonable support
+  mutate(fdiff = factor(diff, levels = sort(unique(diff))))
+
+ol_fm <- as.formula(paste0("fdiff ~ ", paste(inds, collapse = " + ")))
+init <- reg_coeff %>% filter(!grepl("Intercept", term)) %>% pull(estimate)
+ol <- polr(ol_fm, 
+           method = "probit", 
+           data = dt_ol)
+  
+ol_coeff <- coef(ol) %>% data.frame(term = names(.), ol_est = .) %>% mutate(team = gsub("^d_", "", term))
+```
+
+## Compare Estimates
+
+```{r compare ols and ordered reg}
+comp <- merge(reg_coeff %>% rename(ols_est = estimate),
+              ol_coeff,
+              by = c("term", "team"))
+ggplot(comp, aes(ols_est, ol_est)) +
+  geom_point()
+```
+
+
+# Visualize and Output
+
+```{r combine estimates with ranks}
+ranks_b <-
+  merge(x = filter(last_rank, !is.na(last_rank)),
+        y = comp,
+        by = "team",
+        all.y = TRUE) %>%
+  mutate(team = str_replace(team, "_", " ")) %>% 
+  arrange(last_rank)
+```
+
+```{r visualize estimates vs ranks}
+ggplot(ranks_b,
+       aes(x = last_rank, 
+           y = ol_est)) +
+  geom_point() +
+  geom_text(aes(label = team), size = 3) +
+  scale_x_continuous(labels = ranks_b$last_rank, breaks = ranks_b$last_rank) +
+  scale_y_continuous(limits = c(0, NA)) + 
+  labs(x = "Team Rank", y = "Adjusted Goal Differential")
+```
+
+```{r print order of teams by strenght per new data}
+comp %>% 
+  arrange(-ols_est) %>% 
+  select(team, ols_est, ol_est) %>% 
+  head(20)
+```
+
+
+
+# Generate Monkey Bracket
+
+```{r generate monkey bracket}
+# These need to be provided in order on the bracket, i.e. the region, and then the seeding
+bracket_teams <- sapply(c("NE", "E", "MW", "W"), function(x) paste0(x, c(1, 4, 3, 2))) %>% as.vector()
+
+set.seed(60607)
+bracket_str <- sapply(bracket_teams, function(x) runif(1))
+
+bracket_r <- bracket_str
+for (round in 1:4){
+  matchups <- length(bracket_r)/2
+  bracket_r <- sapply(1:matchups, 
+                      function(x) {
+                        pos <- 2*x - 1
+                        matchup <- bracket_r[pos:(pos+1)]
+                        matchup[matchup == max(matchup)]
+                      })
+  print(paste0("Teams picked to win in Round ", round))
+  print(names(bracket_r))
+}
+
+```
+
+
