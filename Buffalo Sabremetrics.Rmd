@@ -349,7 +349,10 @@ score_betas_pref_w %>%
   filter(tourney_team == 1) %>% 
   mutate(Score = Offense + (-Defense)) %>% 
   arrange(-Score) %>% 
-  dplyr::select(Team = team, Offense, Defense, Score)
+  transmute(Team = team, 
+            Offense = round(Offense, 3), 
+            Defense = round(Defense, 3), 
+            Score   = round(Score, 3))
 ```
 
 
