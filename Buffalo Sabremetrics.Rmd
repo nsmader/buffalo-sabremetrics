@@ -9,13 +9,12 @@ output: html_document
 knitr::opts_chunk$set(echo  = TRUE)
 packages.list <- 
   c("openxlsx", "MASS", "tidyverse", "stringr", "ggplot2", "scales", "plotly", 
-    "broom", "lubridate", "stringr", "data.table")
+    "broom", "lubridate", "stringr", "data.table", "ggrepel", "psych")
 for (p in packages.list){
   if (!p %in% installed.packages()[, "Package"]) install.packages(p)
   library(p, character.only = TRUE)
 }
 
-grepv <- function(p, x, ...) grep(pattern = p, x = x, value = TRUE, ...)
 cn <- function(x) colnames(x)
 mean.na <- function(...) mean(na.rm = TRUE, ...)
 sum.na  <- function(...) sum(na.rm = TRUE, ...)
@@ -40,7 +39,7 @@ Read in the USCHO schedule data.
 ### Read data and separate ranks for team names
 d <-
   read.xlsx(xlsxFile = paste0(path, "NCAA Men's Div I Hockey - Season Game Data.xlsx"), 
-            sheet = "2021-22") %>%
+            sheet = "2022-23") %>%
   select(Date = Date1, Opponent, Opp.Score, Home, Score, OT) %>%
   mutate(Date = ymd(Date),
          opp_rank  = ifelse(grepl("\\(\\d+\\)", Opponent), gsub("\\((\\d+)\\).+", "\\1", Opponent), NA) %>% as.numeric(),
@@ -52,7 +51,7 @@ teams <- with(d, c(opp, home)) %>% unique() %>% sort()
 teams
 ```
 
-```{r develop last rank info}
+```{r develop last rank info, eval = any(!is.na(d$opp_rank))}
 ranks <-
   rbind(select(d, Date, team = opp,  rank = opp_rank),
         select(d, Date, team = home, rank = home_rank))
@@ -62,26 +61,28 @@ last_rank <-
   group_by(team) %>%
   summarize(last_rank = max(rank[Date == max(Date)]))
 
-last_rank %>% filter(!is.na(last_rank)) %>% arrange(last_rank)
+last_rank %>% filter(!is.na(last_rank)) %>% arrange(last_rank) 
 ```
 
 # Perform Modeling
 
-```{r prep data for modeling}
+```{r prep data for modeling score differential}
 dt_reg <-
   data.table(d) %>% 
   .[j = paste0("d_", teams) := lapply(teams, function(team) 1*(team == home) + (-1)*(team == opp))] %>%
   mutate(diff = Score - Opp.Score,
          days_since_start = Date - min(Date),
          days_scaled = as.integer(days_since_start) / max(as.integer(days_since_start)) + 1) %>%
-  select(-d_US_Under18_Team) %>%  # -d_Acadia, -d_TBD, 
-  filter(!str_detect("TBD|US_Under18", home) & !grepl("TBD|US_Under18", opp))
+  #select(-d_US_Under18_Team) %>%  # -d_Acadia, -d_TBD, 
+  filter(!str_detect("TBD|US_Under18", home) & !grepl(opp, "TBD|US_Under18"))
 
 filter(dt_reg, str_detect(home, "Minnesota_D")) %>% select(Date, Opp.Score, Score, opp, home, d_Minnesota_Duluth) %>% head()
 filter(dt_reg, str_detect(opp,  "Minnesota_D")) %>% select(Date, Opp.Score, Score, opp, home, d_Minnesota_Duluth) %>% head()
 ```
 
-## Standard OLS for Goal Differential
+## Analyze Goal Differential
+
+### OLS
 
 ```{r ols}
 inds <- str_subset(cn(dt_reg), "^d_")
@@ -96,7 +97,7 @@ reg_coeff <- tidy(reg) %>% mutate(team = gsub("^d_", "", term))
 
 ```
 
-## Ordered Logistic
+### Ordered Logistic
 
 ```{r ordered logstic}
 # See this UCLA stats post with notes on using polr:
@@ -108,16 +109,16 @@ dt_ol <-
   filter(diff %in% -6:6) %>%  # keep data within bounds that have at least some reasonable support
   mutate(fdiff = factor(diff, levels = sort(unique(diff))))
 
-ol_fm <- as.formula(paste0("fdiff ~ ", paste(inds, collapse = " + ")))
+ol_fm <- reformulate(inds, "fdiff") #as.formula(paste0("fdiff ~ ", paste(inds, collapse = " + ")))
 init <- reg_coeff %>% filter(!grepl("Intercept", term)) %>% pull(estimate)
 ol <- polr(ol_fm, 
-           method = "probit", 
+           method = "logistic", 
            data = dt_ol)
   
 ol_coeff <- coef(ol) %>% data.frame(term = names(.), ol_est = .) %>% mutate(team = gsub("^d_", "", term))
 ```
 
-## Compare Estimates
+### Compare Estimates
 
 ```{r compare ols and ordered reg}
 comp <- merge(reg_coeff %>% rename(ols_est = estimate),
@@ -127,8 +128,191 @@ ggplot(comp, aes(ols_est, ol_est)) +
   geom_point()
 ```
 
+## Analyze Home and Opponent Scores Independently
 
-# Visualize and Output
+The general modeling approach is analyzing each score in each game, to evaluate offense against defense in both directions. 
+
+```{r develop data for analyzing individual scores}
+dt_score <- 
+  d %>% 
+  data.table() %>% 
+  mutate(game_id = 1:n(),
+         days_since_start = Date - min(Date),
+         days_scaled = as.integer(days_since_start) / max(as.integer(days_since_start)) + 1) %>%
+  dplyr::select(game_id, Date, days_scaled, Opp.Score, Score, opp, home) %>% 
+  melt(id.vars = c("Date", "days_scaled", "game_id", "opp", "home")) %>% 
+  .[j = `:=`(o = ifelse(str_detect(variable, "Opp"),  opp, home),
+             d = ifelse(str_detect(variable, "Opp"), home, opp))]
+```
+
+### Run Estimation Sensitivity
+
+```{r lmer isn't working, eval = FALSE}
+score_lmer <- 
+  lmer(value ~ o + d + home + (1|game_id), 
+       data = dt_score)
+
+lmer_score_betas <- 
+  coefficients(score_lmer)$game_id %>% 
+  unique() %>% 
+  melt() %>% 
+  as.data.frame()
+```
+
+```{r multiple estimation methods}
+score_ols <- 
+  lm(value ~ o + d + home, 
+     data = dt_score)
+
+score_ols_wgt <- 
+  lm(value ~ o + d + home, 
+     weight = days_scaled^2,
+     data = dt_score)
+
+score_poisson <- 
+  glm(value ~ o + d + home,
+      family = "poisson",
+      data = dt_score)
+
+score_poisson_wgt <- 
+  glm(value ~ o + d + home,
+      family = "poisson",
+      weights = days_scaled^2,
+      data = dt_score)
+
+score_betas <- 
+  bind_rows(tidy(score_ols)         %>% mutate(method = "ols_unwgt"),
+            tidy(score_ols_wgt)     %>% mutate(method = "ols_wgt"),
+            tidy(score_poisson)     %>% mutate(method = "poisson_unwgt"),
+            tidy(score_poisson_wgt) %>% mutate(method = "poisson_wgt")) %>% 
+  mutate(first = str_extract(term, "^(.)"),
+         type = case_when(first == "o" ~ "Offense",
+                          first == "d" ~ "Defense",
+                          first == "h" ~ "Home"))
+```
+
+### Compare and Select Among Estimates
+
+```{r compare results across methods}
+method_comp <-
+  score_betas %>% 
+  mutate(team = str_replace(term, "^(o|d|home)", "")) %>% 
+  dplyr::select(team, estimate, type, method) %>% 
+  filter(!is.na(type)) %>% 
+  pivot_wider(names_from = method,
+              values_from = estimate)
+
+# Examine outliers
+summary(method_comp)
+
+method_comp_trim <-
+  method_comp %>% 
+  filter(ols_unwgt > -5,
+         ols_wgt > -5,
+         poisson_unwgt > -5,
+         poisson_wgt > -5)
+
+# method_comp %>% 
+#   group_by(type) %>% 
+#   summarize(rho = cor(cbind(ols_unwgt, ols_wgt)))#, poisson_unwgt, poisson_wgt)))
+
+lapply(unique(method_comp$type),
+       function(x) {
+         method_comp_trim %>% 
+           filter(type == x) %>% 
+           with(cor(cbind(ols_unwgt, ols_wgt, poisson_unwgt, poisson_wgt)), use = "pairwise") %>% 
+           round(3)
+         })
+
+
+plot_pairs <- function(dt) {
+  options(warn = -1)
+  pairs.panels(method_comp,
+             smooth = TRUE,      # If TRUE, draws loess smooths
+             scale = FALSE,      # If TRUE, scales the correlation text font
+             density = TRUE,     # If TRUE, adds density plots and histograms
+             ellipses = FALSE,    # If TRUE, draws ellipses
+             method = "pearson", # Correlation method (also "spearman" or "kendall")
+             pch = 21,           # pch symbol
+             lm = FALSE,         # If TRUE, plots linear fit rather than the LOESS (smoothed) fit
+             cor = TRUE,         # If TRUE, reports correlations
+             jiggle = FALSE,     # If TRUE, data points are jittered
+             factor = 2,         # Jittering factor
+             hist.col = 4,       # Histograms color
+             stars = TRUE,       # If TRUE, adds significance level with stars
+             ci = TRUE)  
+  options(warn = 0)
+}
+
+for (my_type in unique(method_comp$type)) {
+  method_comp %>% 
+    filter(type == my_type) %>% 
+    dplyr::select(ols_unwgt, ols_wgt, poisson_unwgt, poisson_wgt) %>% 
+    plot_pairs
+}
+
+# Choose preferred specification
+score_betas_pref <- 
+  score_betas %>% 
+  filter(method == "poisson_wgt",
+         estimate > -5)
+```
+
+### Examine Chosen Estimates
+
+```{r visualize estimates}
+score_betas_pref %>% 
+  filter(!is.na(type)) %>% 
+  ggplot(aes(x = estimate,
+             color = type)) +
+  geom_density()
+```
+
+```{r process groups of betas}
+score_betas_pref_w <- 
+  score_betas_pref %>%  
+  filter(!is.na(type)) %>% 
+  mutate(team = str_replace(term, "^(o|d|home)", "")) %>% 
+  dplyr::select(team, estimate, type) %>% 
+  pivot_wider(names_from = "type",
+              values_from = "estimate") 
+```
+
+```{r typologize teams in the bracket}
+tourney_teams_23 <- 
+  c("Denver", "Cornell", "Western_Michigan", "Boston_University",
+    "Minnesota", "Canisius", "Minnesota_State", "St_Cloud_State",
+    "Michigan", "Colgate", "Michigan_Tech", "Penn_State",
+    "Quinnipiac", "Merrimack", "Ohio_State", "Harvard")
+
+stopifnot(all(tourney_teams_23 %in% score_betas_pref_w$team))
+
+score_betas_pref_w <- 
+  score_betas_pref_w %>% 
+  mutate(tourney_team = 1*(team %in% tourney_teams_23))
+```
+
+
+```{r show scatter of best team offense and defense}
+score_betas_pref_w %>% 
+  ggplot(aes(x = -Defense,
+             y = Offense,
+             color = factor(tourney_team))) +
+  geom_point()
+```
+```{r show just the tourney teams}
+score_betas_pref_w %>% 
+  filter(tourney_team == 1) %>% 
+  ggplot(aes(x = -Defense,
+             y = Offense)) +
+  geom_point() +
+  geom_text_repel(aes(label = team))
+  
+```
+
+# Use Estimates for Selection
+
+## Visualize Ranks from Goal Differential
 
 ```{r combine estimates with ranks}
 ranks_b <-
@@ -151,13 +335,22 @@ ggplot(ranks_b,
   labs(x = "Team Rank", y = "Adjusted Goal Differential")
 ```
 
-```{r print order of teams by strenght per new data}
+```{r print order of teams by strength per new data}
 comp %>% 
   arrange(-ols_est) %>% 
   select(team, ols_est, ol_est) %>% 
   head(20)
 ```
 
+## Visualize Ranks from Score-Based Analysis
+
+```{r}
+score_betas_pref_w %>% 
+  filter(tourney_team == 1) %>% 
+  mutate(Score = Offense + (-Defense)) %>% 
+  arrange(-Score) %>% 
+  dplyr::select(Team = team, Offense, Defense, Score)
+```
 
 
 # Generate Monkey Bracket
@@ -166,7 +359,7 @@ comp %>%
 # These need to be provided in order on the bracket, i.e. the region, and then the seeding
 bracket_teams <- sapply(c("NE", "E", "MW", "W"), function(x) paste0(x, c(1, 4, 3, 2))) %>% as.vector()
 
-set.seed(60607)
+set.seed(as.integer(as.Date("2023-03-22")))
 bracket_str <- sapply(bracket_teams, function(x) runif(1))
 
 bracket_r <- bracket_str
